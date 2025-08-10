@@ -1,0 +1,142 @@
+name: Org Hardener
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Preview only (no writes)"
+        type: boolean
+        default: true
+      subset:
+        description: "Comma-separated repo names (optional)"
+        default: ""
+
+jobs:
+  harden:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Create app token (org-wide)
+        id: app
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.ORG_APP_ID }}
+          private-key: ${{ secrets.ORG_APP_PRIVATE_KEY }}
+          owner: jai-nexus
+
+      - name: Harden repos
+        uses: actions/github-script@v7
+        env:
+          ORG: jai-nexus
+          DRY: ${{ inputs.dry_run }}
+          SUBSET: ${{ inputs.subset }}
+          TOPICS: '["jai","jai-nexus","agents","ai-infra","nexus"]'
+          REPO_MAP: |
+            {
+              "agency-nexus":"Agency orchestrator; integrates with agent.jai.nexus",
+              "actions-nexus":"Reusable GitHub Actions and org-wide CI workflows",
+              "adminops-nexus":"AdminOps automation, release hygiene, runbooks",
+              "api-nexus":"API gateway schemas, SDKs, rate limiting",
+              "archive-nexus":".jai archives + daily Merkle commitments (public log)",
+              "assets-nexus":"Brand/system assets (logos, icons, diagrams), LFS-ready",
+              "audit-nexus":"Audit specs & tools",
+              "audittrail-nexus":"Append-only audit log mirror",
+              "backups-nexus":"Encrypted backups, DR strategy & restore playbooks",
+              "cognition-nexus":"Reasoning/planning logic, recursive thought",
+              "community-nexus":"Public contributor workflows & interfaces",
+              "compliance-nexus":"Controls, policies, retention, export; SOC2/SLSA docs & checks",
+              "datacontracts-nexus":"Event & data-model contracts (JSON Schema/Proto) + contract tests",
+              "datasets-nexus":"Curated datasets manifests & lineage (no raw PII)",
+              "docs-nexus":"Canonical docs & GH Pages (specs, runbooks, decisions)",
+              "evals-nexus":"Agent/model evals, red-team suites & regression harness",
+              "failsafe-nexus":"Watchdogs, self-healing, time-capsule & rollback",
+              "finops-nexus":"FinOps: cost telemetry, budgets, showback/chargeback",
+              "framework-nexus":"CLI scaffolds, dev scripts, codegen templates",
+              "identity-nexus":"SSO/OIDC, org IAM, repo RBAC & service accounts",
+              "infra-nexus":"IaC, containers, environments, bootstrap",
+              "integrations-nexus":"External connectors (Notion, GitHub, Jira, Sheets)",
+              "intelligence-nexus":"Model library, training loops, weights configs",
+              "jai-format":".jai spec + reference encoder/decoder (multi-language)",
+              "jai-nexus":"JAI NEXUS — privacy-first, modular infrastructure for agents, memory, orchestration, and secure workflows across domains",
+              "keytrust-nexus":"KMS/HSM proxy, signatures, rotation, escrow",
+              "lifecycle-nexus":"Model/agent lifecycle controller, CI/CD glue",
+              "memory-nexus":"Vector stores, chunking, embeddings, RAG configs",
+              "modelops-nexus":"Model registry, promotion gates, rollbacks, .jai audit trails",
+              "observe-nexus":"Telemetry/logs/metrics dashboards",
+              "orchestrator-nexus":"Global workflow coordinator (advanced)",
+              "personas-nexus":"Agent persona contracts, prompt packs, safety profiles",
+              "private-nexus":"Private agents & encrypted memory (handler-only)",
+              "public-nexus":"Public site / portals / CORS edge",
+              "release-nexus":"Release engineering, versioning, SBOM, provenance/signing (SLSA)",
+              "runtime-nexus":"Core agent executor / kernel / workers",
+              "sandbox-nexus":"Isolated staging sandboxes",
+              "sdk-js":"First-class TypeScript/JS SDK(s), publishable to npm",
+              "sdk-python":"First-class Python SDK(s) built from api-nexus schemas, publishable to PyPI",
+              "secureboot-nexus":"Root-of-trust, image/boot attestation",
+              "security-nexus":"Policy-as-code enforcement, DLP/guardrails",
+              "source-tree":"Docs & scaffold for JAI Source-Tree v3.0",
+              "status-nexus":"Public status page & health check proxy",
+              "telemetry-nexus":"Telemetry pipelines (if split from observe)",
+              "threatmodel-nexus":"STRIDE/LINDDUN models, misuse cases, mitigations",
+              "tools-nexus":"Agent tool registry & capability packs",
+              "transit-nexus":"Event bus & data-in-motion proxies",
+              "trustlayer-nexus":"Cross-repo trust proofs & attestations",
+              "vault-nexus":"Encrypted secret vault separate from keytrust",
+              "workflow-nexus":"DAG scheduler and job/orchestration logic"
+            }
+        with:
+          github-token: ${{ steps.app.outputs.token }}
+          script: |
+            const org = process.env.ORG;
+            const dry = (process.env.DRY === 'true');
+            const subset = (process.env.SUBSET || '').split(',').map(s => s.trim()).filter(Boolean);
+            const topics = JSON.parse(process.env.TOPICS);
+            const map = JSON.parse(process.env.REPO_MAP);
+            const targets = subset.length ? subset : Object.keys(map);
+
+            for (const repo of targets) {
+              const desc = map[repo] || null;
+              core.startGroup(`🔧 ${org}/${repo}`);
+              try {
+                const patch = {
+                  ...(desc ? { description: desc } : {}),
+                  has_issues: true, has_projects: false, has_wiki: false,
+                  allow_squash_merge: true, allow_rebase_merge: true, allow_merge_commit: false,
+                  default_branch: 'main',
+                  security_and_analysis: {
+                    secret_scanning: { status: 'enabled' },
+                    secret_scanning_push_protection: { status: 'enabled' }
+                  }
+                };
+                if (!dry) {
+                  await github.request('PATCH /repos/{owner}/{repo}', { owner: org, repo, ...patch });
+                  await github.request('PUT /repos/{owner}/{repo}/topics', { owner: org, repo, names: topics });
+                }
+
+                let hasMain = true;
+                try { await github.request('GET /repos/{owner}/{repo}/branches/{branch}', { owner: org, repo, branch: 'main' }); }
+                catch { hasMain = false; }
+                if (hasMain && !dry) {
+                  await github.request('PUT /repos/{owner}/{repo}/branches/{branch}/protection', {
+                    owner: org, repo, branch: 'main',
+                    required_status_checks: { strict: true, contexts: [] },
+                    enforce_admins: true,
+                    required_pull_request_reviews: { required_approving_review_count: 1, dismiss_stale_reviews: true },
+                    restrictions: null,
+                    required_linear_history: true,
+                    allow_force_pushes: false,
+                    allow_deletions: false,
+                    required_conversation_resolution: true
+                  });
+                }
+
+                if (!dry) {
+                  await github.request('PUT /repos/{owner}/{repo}/vulnerability-alerts', { owner: org, repo });
+                }
+
+                core.info(`✅ ${repo} ${dry ? '(dry-run)' : 'hardened'}${hasMain ? '' : ' (no main yet)'}`);
+              } catch (e) {
+                core.warning(`❌ ${repo}: ${e.message}`);
+              }
+              core.endGroup();
+            }
