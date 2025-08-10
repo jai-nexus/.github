@@ -1,0 +1,71 @@
+name: Org Inventory
+on:
+  workflow_dispatch:
+    inputs:
+      subset:
+        description: "Comma-separated repo names (optional)"
+        default: ""
+      issue_number:
+        description: "Issue to comment summary on (optional)"
+        default: "26"
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create app token (org-wide)
+        id: app
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.ORG_APP_ID }}
+          private-key: ${{ secrets.ORG_APP_PRIVATE_KEY }}
+          owner: jai-nexus
+
+      - name: Build CSV
+        id: inv
+        uses: actions/github-script@v7
+        env:
+          ORG: jai-nexus
+          SUBSET: ${{ inputs.subset }}
+        with:
+          github-token: ${{ steps.app.outputs.token }}
+          script: |
+            const org = process.env.ORG;
+            const subset = (process.env.SUBSET||'').split(',').map(s=>s.trim()).filter(Boolean);
+            const { data: repos } = await github.request('GET /orgs/{org}/repos', { org, per_page: 200, type: 'all' });
+            const targets = subset.length ? repos.filter(r => subset.includes(r.name)) : repos;
+            const hdr = ['name','private','has_desc','issues','wiki','projects','topics','protected_main','vuln_alerts','secret_scanning','push_protection'];
+            let rows = [hdr.join(',')];
+            for (const r of targets) {
+              let protectedMain = false;
+              try { const br = await github.request('GET /repos/{owner}/{repo}/branches/{branch}', { owner: org, repo: r.name, branch: 'main' }); protectedMain = !!br.data.protected; } catch {}
+              let sec = r.security_and_analysis || {};
+              const hasDesc = !!(r.description && r.description.length);
+              rows.push([
+                r.name, r.private, hasDesc, r.has_issues, r.has_wiki, r.has_projects,
+                (r.topics||[]).join(';'), protectedMain,
+                r.has_vulnerability_alerts ?? '',
+                sec.secret_scanning?.status ?? '',
+                sec.secret_scanning_push_protection?.status ?? ''
+              ].join(','));
+            }
+            core.setOutput('csv', rows.join('\n'));
+
+      - name: Save artifact
+        run: |
+          mkdir -p out
+          printf "%s" "${{ steps.inv.outputs.csv }}" > out/inventory.csv
+      - uses: actions/upload-artifact@v4
+        with: { name: org-inventory, path: out/inventory.csv }
+
+      - name: Comment to Issue (optional)
+        if: ${{ inputs.issue_number != '' }}
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.app.outputs.token }}
+          script: |
+            await github.rest.issues.createComment({
+              owner: 'jai-nexus', repo: 'jai-nexus',
+              issue_number: Number('${{ inputs.issue_number }}'),
+              body: "Inventory generated. Download artifact **org-inventory** from this run. Next: run **Org Hardener** (dry_run first)."
+            });
