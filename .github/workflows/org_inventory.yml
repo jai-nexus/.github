@@ -7,7 +7,7 @@ on:
         default: ""
       issue_number:
         description: "Issue to comment summary on (optional)"
-        default: "26"
+        default: ""   # keep empty to skip comment
 
 jobs:
   report:

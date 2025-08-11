@@ -98,7 +98,6 @@ jobs:
               const desc = map[repo] || null;
               core.startGroup(`🔧 ${org}/${repo}`);
               try {
-                // 1) repo settings + secret scanning + push protection
                 const patch = {
                   ...(desc ? { description: desc } : {}),
                   has_issues: true, has_projects: false, has_wiki: false,
@@ -113,7 +112,6 @@ jobs:
                   await github.request('PUT /repos/{owner}/{repo}/topics', { owner: org, repo, names: topics });
                 }
 
-                // 2) branch protection (skip if no main yet)
                 let hasMain = true;
                 try { await github.request('GET /repos/{owner}/{repo}/branches/{branch}', { owner: org, repo, branch: 'main' }); }
                 catch { hasMain = false; }
@@ -131,7 +129,6 @@ jobs:
                   });
                 }
 
-                // 3) vulnerability alerts
                 if (!dry) {
                   await github.request('PUT /repos/{owner}/{repo}/vulnerability-alerts', { owner: org, repo });
                 }
