@@ -13,16 +13,23 @@ on:
 jobs:
   harden:
     runs-on: ubuntu-latest
+    # Lock down the default token; we use the App token for writes.
     permissions:
       contents: read
+
     steps:
-      - name: Create app token (org-wide)
+      - name: Create org-scoped app token
         id: app
         uses: actions/create-github-app-token@v2
         with:
           app-id: ${{ secrets.ORG_APP_ID }}
           private-key: ${{ secrets.ORG_APP_PRIVATE_KEY }}
           owner: jai-nexus
+          # Fine-grain the installation token to what the script actually needs:
+          permission-administration: write     # repo settings, branch protection
+          permission-contents: read            # read repo details/topics
+          permission-security-events: write    # enabling vulnerability alerts, security settings
+          # (correct per-permission syntax for this action)                     # <-- important
 
       - name: Harden repos
         uses: actions/github-script@v7
@@ -98,6 +105,7 @@ jobs:
               const desc = map[repo] || null;
               core.startGroup(`🔧 ${org}/${repo}`);
               try {
+                // 1) repo settings + secret scanning + push protection
                 const patch = {
                   ...(desc ? { description: desc } : {}),
                   has_issues: true, has_projects: false, has_wiki: false,
@@ -112,9 +120,13 @@ jobs:
                   await github.request('PUT /repos/{owner}/{repo}/topics', { owner: org, repo, names: topics });
                 }
 
+                // 2) branch protection (skip if no main yet)
                 let hasMain = true;
-                try { await github.request('GET /repos/{owner}/{repo}/branches/{branch}', { owner: org, repo, branch: 'main' }); }
-                catch { hasMain = false; }
+                try {
+                  await github.request('GET /repos/{owner}/{repo}/branches/{branch}', { owner: org, repo, branch: 'main' });
+                } catch {
+                  hasMain = false;
+                }
                 if (hasMain && !dry) {
                   await github.request('PUT /repos/{owner}/{repo}/branches/{branch}/protection', {
                     owner: org, repo, branch: 'main',
@@ -129,8 +141,13 @@ jobs:
                   });
                 }
 
+                // 3) vulnerability alerts
                 if (!dry) {
-                  await github.request('PUT /repos/{owner}/{repo}/vulnerability-alerts', { owner: org, repo });
+                  try {
+                    await github.request('PUT /repos/{owner}/{repo}/vulnerability-alerts', { owner: org, repo });
+                  } catch (err) {
+                    core.info(`(skipped enabling vulnerability alerts: ${err.status || ''})`);
+                  }
                 }
 
                 core.info(`✅ ${repo} ${dry ? '(dry-run)' : 'hardened'}${hasMain ? '' : ' (no main yet)'}`);
