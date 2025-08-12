@@ -1,0 +1,50 @@
+<!doctype html><meta charset="utf-8" />
+<title>JAI NEXUS — Tasks</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<style>
+  body{font-family:system-ui,sans-serif;margin:24px;max-width:1100px}
+  header{display:flex;gap:12px;align-items:center;margin-bottom:16px}
+  .pill{padding:.25rem .6rem;border-radius:999px;background:#eee;font-size:.85rem}
+  .row{border:1px solid #ddd;border-radius:10px;padding:12px 14px;margin:8px 0}
+  .meta{font-size:.85rem;color:#555;display:flex;gap:10px;flex-wrap:wrap}
+  .bar{height:8px;background:#eee;border-radius:999px;overflow:hidden;margin-top:8px}
+  .fill{height:100%}
+  .gh{background:#276ef1}.notion{background:#0ea5e9}.done .fill{background:#22c55e}
+</style>
+<header>
+  <h1 style="margin:0">JAI NEXUS — Live Tasks</h1>
+  <span id="xp" class="pill">XP 0</span>
+  <span id="open" class="pill">Open 0</span>
+  <span id="done" class="pill">Done 0</span>
+</header>
+<div id="list"></div>
+<script>
+(async () => {
+  const res = await fetch('./data/tasks.json', {cache:'no-store'});
+  const data = await res.json();
+  document.getElementById('xp').textContent   = `XP ${data.totals.xp}`;
+  document.getElementById('open').textContent = `Open ${data.totals.open}`;
+  document.getElementById('done').textContent = `Done ${data.totals.done}`;
+  const byType = (a,b) => (a.type||'task').localeCompare(b.type||'task') || (b.points-a.points);
+  const list = document.getElementById('list');
+  data.tasks.sort(byType).forEach(t => {
+    const el = document.createElement('div'); el.className = 'row ' + (t.status==='done'?'done':'');
+    const src = t.source==='github'?'gh':'notion';
+    const pct = Math.round((t.progress ?? (t.status==='done'?1:0))*100);
+    el.innerHTML = `
+      <div style="display:flex;justify-content:space-between;gap:8px;align-items:baseline">
+        <a href="${t.url}" target="_blank" style="font-weight:600">${t.title}</a>
+        <span class="pill">${t.points} pts</span>
+      </div>
+      <div class="meta">
+        <span class="pill ${src}">${t.source}</span>
+        ${t.repo?`<span class="pill">${t.repo} #${t.number||''}</span>`:''}
+        ${(t.type?`<span class="pill">${t.type}</span>`:'')}
+        ${(t.tags||[]).slice(0,4).map(x=>`<span class="pill">${x}</span>`).join('')}
+      </div>
+      <div class="bar"><div class="fill" style="width:${pct}%;"></div></div>
+    `;
+    list.appendChild(el);
+  });
+})();
+</script>
