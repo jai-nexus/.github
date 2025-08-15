@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       publish:
-        description: "Publish to public-nexus (via PR)"
+        description: "Publish to dev.jai.nexus (via PR)"
         type: boolean
         default: true
       subset:
@@ -13,7 +13,6 @@ on:
   schedule:
     - cron: "15 * * * *" # hourly at :15
 
-# Repo's GITHUB_TOKEN only needs read; writes use the App token.
 permissions:
   contents: read
 
@@ -29,7 +28,7 @@ jobs:
           private-key: ${{ secrets.ORG_APP_PRIVATE_KEY }}
           owner: jai-nexus
           repositories: public-nexus
-          # App must be installed with: Contents:write and Pull requests:write
+          # App installation must grant: Contents:write, Pull requests:write
 
       - name: Checkout .github (this repo)
         uses: actions/checkout@v4
@@ -48,8 +47,13 @@ jobs:
           NOTION_TASKS_DB: ${{ secrets.NOTION_TASKS_DB }}
         run: |
           set -euo pipefail
-          # Replace with your real aggregator script:
-          node codex/aggregate_tasks.mjs
+          mkdir -p out
+          # Replace this with your real aggregator when ready:
+          if [ -f codex/aggregate_tasks.mjs ]; then
+            node codex/aggregate_tasks.mjs
+          else
+            echo '{"items":[{"id":"bootstrap","title":"Replace aggregate_tasks.mjs with real aggregator"}]}' > out/tasks.json
+          fi
           echo "Preview (top 40 lines):"
           head -n 40 out/tasks.json || true
 
@@ -62,18 +66,16 @@ jobs:
       - name: Publish to public-nexus (branch + PR)
         if: ${{ github.event_name == 'schedule' || github.event.inputs.publish != 'false' }}
         env:
-          GH_TOKEN: ${{ steps.app.outputs.token }}      # used by gh
+          GH_TOKEN: ${{ steps.app.outputs.token }}
           GIT_AUTHOR_NAME: "jai-org-hardener[bot]"
           GIT_AUTHOR_EMAIL: "bots@jai.nexus"
           GIT_COMMITTER_NAME: "jai-org-hardener[bot]"
           GIT_COMMITTER_EMAIL: "bots@jai.nexus"
         run: |
           set -euo pipefail
+          export GITHUB_TOKEN="$GH_TOKEN"   # ensure gh uses the App token
 
-          # Clone target site repo with App token
           git clone --depth=1 "https://x-access-token:${GH_TOKEN}@github.com/jai-nexus/public-nexus.git" site
-
-          # Drop in JSON (and optional UI)
           mkdir -p site/data
           cp -f out/tasks.json site/data/tasks.json
           if [ -f codex/tasks_index.html ]; then
@@ -86,13 +88,11 @@ jobs:
             echo "No changes to publish."; exit 0
           fi
 
-          # Create branch (main is protected) and push
           branch="org-tasks-$(date +%Y%m%d-%H%M%S)"
           git checkout -b "$branch"
           git commit -m "site(tasks): automated update of org tasks JSON + UI"
           git push origin "$branch"
 
-          # Open PR to main
           gh pr create \
             --repo jai-nexus/public-nexus \
             --head "$branch" \
