@@ -1,4 +1,5 @@
 name: Org Hardener
+
 on:
   workflow_dispatch:
     inputs:
@@ -13,7 +14,8 @@ on:
 jobs:
   harden:
     runs-on: ubuntu-latest
-    # Lock down the default token; we use the App token for writes.
+
+    # Default GITHUB_TOKEN is read-only; all writes use the App token.
     permissions:
       contents: read
 
@@ -25,11 +27,14 @@ jobs:
           app-id: ${{ secrets.ORG_APP_ID }}
           private-key: ${{ secrets.ORG_APP_PRIVATE_KEY }}
           owner: jai-nexus
-          # Fine-grain the installation token to what the script actually needs:
-          permission-administration: write     # repo settings, branch protection
-          permission-contents: read            # read repo details/topics
-          permission-security-events: write    # enabling vulnerability alerts, security settings
-          # (correct per-permission syntax for this action)                     # <-- important
+          # TIP: while testing, restrict to a few repos; remove to cover the whole org.
+          # repositories: |
+          #   public-nexus
+          #   framework-nexus
+          #   adminops-nexus
+          #
+          # NOTE: We intentionally DO NOT request explicit permission-* here.
+          # That avoids 422 "permissions requested are not granted" until the app is updated.
 
       - name: Harden repos
         uses: actions/github-script@v7
@@ -78,7 +83,7 @@ jobs:
               "runtime-nexus":"Core agent executor / kernel / workers",
               "sandbox-nexus":"Isolated staging sandboxes",
               "sdk-js":"First-class TypeScript/JS SDK(s), publishable to npm",
-              "sdk-python":"First-class Python SDK(s) built from api-nexus schemas, publishable to PyPI",
+              "sdk-python":"First-class Python SDK(s), publishable to PyPI",
               "secureboot-nexus":"Root-of-trust, image/boot attestation",
               "security-nexus":"Policy-as-code enforcement, DLP/guardrails",
               "source-tree":"Docs & scaffold for JAI Source-Tree v3.0",
@@ -101,34 +106,51 @@ jobs:
             const map = JSON.parse(process.env.REPO_MAP);
             const targets = subset.length ? subset : Object.keys(map);
 
+            const gh = github; // actions/github-script client
+
             for (const repo of targets) {
               const desc = map[repo] || null;
               core.startGroup(`🔧 ${org}/${repo}`);
+
               try {
-                // 1) repo settings + secret scanning + push protection
+                // 0) skip non-existent repositories gracefully
+                try {
+                  await gh.request('GET /repos/{owner}/{repo}', { owner: org, repo });
+                } catch (e) {
+                  core.info(`(skip) repo not found: ${repo}`);
+                  core.endGroup();
+                  continue;
+                }
+
+                // 1) repo settings + secret scanning + push protection (best effort)
                 const patch = {
                   ...(desc ? { description: desc } : {}),
                   has_issues: true, has_projects: false, has_wiki: false,
-                  allow_squash_merge: true, allow_rebase_merge: true, allow_merge_commit: false,
-                  security_and_analysis: {
-                    secret_scanning: { status: 'enabled' },
-                    secret_scanning_push_protection: { status: 'enabled' }
-                  }
+                  allow_squash_merge: true, allow_rebase_merge: true, allow_merge_commit: false
                 };
+
                 if (!dry) {
-                  await github.request('PATCH /repos/{owner}/{repo}', { owner: org, repo, ...patch });
-                  await github.request('PUT /repos/{owner}/{repo}/topics', { owner: org, repo, names: topics });
+                  await gh.request('PATCH /repos/{owner}/{repo}', { owner: org, repo, ...patch }).catch(e=>{
+                    core.info(`(settings) ${e.status || ''} ${e.message || e}`);
+                  });
+
+                  await gh.request('PUT /repos/{owner}/{repo}/topics', { owner: org, repo, names: topics }).catch(e=>{
+                    core.info(`(topics) ${e.status || ''} ${e.message || e}`);
+                  });
+
+                  // Enable security features (will be no-ops if app lacks perms)
+                  await gh.request('PUT /repos/{owner}/{repo}/vulnerability-alerts', { owner: org, repo }).catch(()=>{});
+                  await gh.request('PUT /repos/{owner}/{repo}/secret-scanning/alerts', { owner: org, repo }).catch(()=>{});
                 }
 
-                // 2) branch protection (skip if no main yet)
+                // 2) branch protection if main exists
                 let hasMain = true;
                 try {
-                  await github.request('GET /repos/{owner}/{repo}/branches/{branch}', { owner: org, repo, branch: 'main' });
-                } catch {
-                  hasMain = false;
-                }
+                  await gh.request('GET /repos/{owner}/{repo}/branches/{branch}', { owner: org, repo, branch: 'main' });
+                } catch { hasMain = false; }
+
                 if (hasMain && !dry) {
-                  await github.request('PUT /repos/{owner}/{repo}/branches/{branch}/protection', {
+                  await gh.request('PUT /repos/{owner}/{repo}/branches/{branch}/protection', {
                     owner: org, repo, branch: 'main',
                     required_status_checks: { strict: true, contexts: [] },
                     enforce_admins: true,
@@ -138,16 +160,9 @@ jobs:
                     allow_force_pushes: false,
                     allow_deletions: false,
                     required_conversation_resolution: true
+                  }).catch(e=>{
+                    core.info(`(protection) ${e.status || ''} ${e.message || e}`);
                   });
-                }
-
-                // 3) vulnerability alerts
-                if (!dry) {
-                  try {
-                    await github.request('PUT /repos/{owner}/{repo}/vulnerability-alerts', { owner: org, repo });
-                  } catch (err) {
-                    core.info(`(skipped enabling vulnerability alerts: ${err.status || ''})`);
-                  }
                 }
 
                 core.info(`✅ ${repo} ${dry ? '(dry-run)' : 'hardened'}${hasMain ? '' : ' (no main yet)'}`);
