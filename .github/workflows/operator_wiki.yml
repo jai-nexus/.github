@@ -4,59 +4,74 @@ on:
   workflow_dispatch:
     inputs:
       domain:
-        description: "Domain to attach (leave empty to skip)"
+        description: "Domain to attach on Vercel (optional)"
         required: false
         default: dev.jai.nexus
+      auto_merge:
+        description: "Auto‑merge autofix PRs (reserved)"
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: read
 
 jobs:
   make_it_so:
     runs-on: ubuntu-latest
+    # Put secrets into env so we can test them without leaking values
+    env:
+      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+      VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+      VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+      REVALIDATE_TOKEN: ${{ secrets.REVALIDATE_TOKEN }}
+      DOMAIN: ${{ inputs.domain }}
+      NEXT_PUBLIC_NEXUS_FEED: https://jai-nexus.github.io/public-nexus/data/nexus.json
+      NEXT_PUBLIC_TASKS_FEED: https://jai-nexus.github.io/public-nexus/data/tasks.json
     steps:
-      - name: Configure Vercel (env + domain)
-        env:
-          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
-          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
-          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
-          DOMAIN: ${{ inputs.domain }}
-          NEXT_PUBLIC_NEXUS_FEED: https://jai-nexus.github.io/public-nexus/data/nexus.json
-          NEXT_PUBLIC_TASKS_FEED: https://jai-nexus.github.io/public-nexus/data/tasks.json
-          REVALIDATE_TOKEN: ${{ secrets.REVALIDATE_TOKEN }}
+      - name: Configure Vercel (env + domain) — idempotent
         run: |
           set -euo pipefail
-          miss=()
-          for k in VERCEL_TOKEN VERCEL_PROJECT_ID VERCEL_ORG_ID; do
-            [ -z "${!k:-}" ] && miss+=("$k")
-          done
-          if [ "${#miss[@]}" -gt 0 ]; then
-            echo "Vercel config skipped; missing: ${miss[*]}"; exit 0; fi
 
+          # Skip if required Vercel creds are absent
+          miss=""
+          for k in VERCEL_TOKEN VERCEL_PROJECT_ID VERCEL_ORG_ID; do
+            [ -z "${!k:-}" ] && miss="$miss $k"
+          done
+          if [ -n "$miss" ]; then
+            echo "Skipping Vercel config; missing:$miss"
+            exit 0
+          fi
+
+          # Upsert env vars (safe to repeat)
           for kv in \
-            "NEXT_PUBLIC_NEXUS_FEED=$NEXT_PUBLIC_NEXUS_FEED" \
-            "NEXT_PUBLIC_TASKS_FEED=$NEXT_PUBLIC_TASKS_FEED" \
-            "REVALIDATE_TOKEN=$REVALIDATE_TOKEN"; do
+            "NEXT_PUBLIC_NEXUS_FEED=${NEXT_PUBLIC_NEXUS_FEED}" \
+            "NEXT_PUBLIC_TASKS_FEED=${NEXT_PUBLIC_TASKS_FEED}" \
+            "REVALIDATE_TOKEN=${REVALIDATE_TOKEN}"
+          do
             key="${kv%%=*}"; val="${kv#*=}"
             [ -z "$val" ] && continue
-            curl -fsS -X POST "https://api.vercel.com/v10/projects/$VERCEL_PROJECT_ID/env" \
-              -H "Authorization: Bearer $VERCEL_TOKEN" \
+            curl -fsS -X POST "https://api.vercel.com/v10/projects/${VERCEL_PROJECT_ID}/env" \
+              -H "Authorization: Bearer ${VERCEL_TOKEN}" \
               -H "Content-Type: application/json" \
-              --data "{\"type\":\"encrypted\",\"key\":\"$key\",\"value\":\"$val\",\"target\":[\"production\",\"preview\"]}" \
+              --data '{"type":"encrypted","key":"'"$key"'","value":"'"$val"'","target":["production","preview"]}' \
               || true
           done
 
+          # Attach domain (idempotent; 409 is fine if already added)
           if [ -n "${DOMAIN:-}" ]; then
-            curl -fsS -X POST "https://api.vercel.com/v10/projects/$VERCEL_PROJECT_ID/domains" \
-              -H "Authorization: Bearer $VERCEL_TOKEN" \
+            curl -fsS -X POST "https://api.vercel.com/v10/projects/${VERCEL_PROJECT_ID}/domains" \
+              -H "Authorization: Bearer ${VERCEL_TOKEN}" \
               -H "Content-Type: application/json" \
-              --data "{\"name\":\"$DOMAIN\"}" || true
+              --data '{"name":"'"${DOMAIN}"'"}' \
+              || true
           fi
 
-      - name: Revalidate dev.jai.nexus
-        if: ${{ secrets.REVALIDATE_TOKEN != '' }}
-        env:
-          TOKEN: ${{ secrets.REVALIDATE_TOKEN }}
+      - name: Revalidate site (optional)
+        if: ${{ env.REVALIDATE_TOKEN != '' && env.DOMAIN != '' }}
         run: |
           set -euo pipefail
-          curl -fsS -X POST "https://dev.jai.nexus/api/revalidate" \
-            -H "Authorization: Bearer $TOKEN" \
+          curl -fsS -X POST "https://${DOMAIN}/api/revalidate" \
+            -H "Authorization: Bearer $REVALIDATE_TOKEN" \
             -H "Content-Type: application/json" \
             -d '{"path":"/*"}' || true
