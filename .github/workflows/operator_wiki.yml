@@ -1,307 +1,62 @@
-name: Operator — Make dev.jai.nexus live
+name: Operator — Wiki
 
 on:
   workflow_dispatch:
     inputs:
-      auto_merge:
-        description: "Automatically merge the PR into wiki-nexus/main if allowed"
-        type: boolean
-        default: true
       domain:
-        description: "Domain to attach (Vercel). Default: dev.jai.nexus"
-        default: "dev.jai.nexus"
-
-concurrency:
-  group: operator-wiki
-  cancel-in-progress: true
-
-permissions:
-  contents: read
+        description: "Domain to attach (leave empty to skip)"
+        required: false
+        default: dev.jai.nexus
 
 jobs:
   make_it_so:
     runs-on: ubuntu-latest
-    env:
-      ORG: jai-nexus
-      WIKI_REPO: wiki-nexus
-      PUBLIC_REPO: public-nexus
-      BRANCH: operator/wiki-autofix
-      PR_TITLE: "operator: bring wiki online (null-safe + revalidate + api)"
-      PR_BODY: "Automated patch from .github/operator_wiki workflow."
-      DOMAIN: ${{ github.event.inputs.domain }}
     steps:
-      - name: Create org-scoped app token
-        id: app
-        uses: actions/create-github-app-token@v2
-        with:
-          app-id: ${{ secrets.ORG_APP_ID }}
-          private-key: ${{ secrets.ORG_APP_PRIVATE_KEY }}
-          owner: ${{ env.ORG }}
-          repositories: ${{ env.WIKI_REPO }},${{ env.PUBLIC_REPO }}
-
-      - name: Set up tools
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-
-      - name: Clone wiki-nexus
-        env:
-          GH_TOKEN: ${{ steps.app.outputs.token }}
-        run: |
-          set -euo pipefail
-          git clone --depth=1 "https://x-access-token:${GH_TOKEN}@github.com/${ORG}/${WIKI_REPO}.git" wiki
-          cd wiki
-          git checkout -B "${BRANCH}"
-
-      - name: Patch repo (null-safety, env, api routes, versions)
-        working-directory: wiki
-        run: |
-          set -euo pipefail
-
-          # helper: write a file only if content differs
-          write() {
-            local path="$1"; shift
-            mkdir -p "$(dirname "$path")"
-            tmp="$(mktemp)"; cat > "$tmp"
-            if [ ! -f "$path" ] || ! diff -u "$path" "$tmp" >/dev/null 2>&1; then
-              cp -f "$path" "$path.bak" 2>/dev/null || true
-              mv "$tmp" "$path"
-              echo "WROTE $path"
-            else
-              rm -f "$tmp"
-              echo "UNCHANGED $path"
-            fi
-          }
-
-          # lib/safe.ts
-          write lib/safe.ts <<'TS'
-          export const arr = <T>(v: T[] | null | undefined): T[] => (Array.isArray(v) ? v : []);
-          export const str = (v: unknown, fallback = "—") =>
-            (typeof v === "string" && v.trim() ? v : fallback);
-          TS
-
-          # lib/env.ts
-          write lib/env.ts <<'TS'
-          export const REVALIDATE_TOKEN = process.env.REVALIDATE_TOKEN ?? "";
-          export const FEED_URL = process.env.NEXT_PUBLIC_NEXUS_FEED ?? "";
-          export const TASKS_URL = process.env.NEXT_PUBLIC_TASKS_FEED ?? "";
-          TS
-
-          # lib/types.ts
-          write lib/types.ts <<'TS'
-          export type Agent   = { id: string; name: string; url?: string; tags?: string[] };
-          export type Context = { id: string; name: string; url?: string; tags?: string[] };
-          export type Asset   = { id: string; name: string; url?: string; tags?: string[] };
-
-          export type Nexus = {
-            generatedAt?: string;
-            agents?: Agent[];
-            contexts?: Context[];
-            assets?: Asset[];
-          };
-
-          export type Task = {
-            source?: string; type?: string; repo?: string; number?: number;
-            title?: string; url?: string; points?: number; status?: string; tags?: string[];
-          };
-
-          export type TasksDoc = {
-            generatedAt?: string;
-            totals?: Record<string, number>;
-            tasks?: Task[];
-            items?: Task[]; // legacy fallback
-          };
-
-          export type RevalidateRequest = { path: string };
-          export type RevalidateResponse = { revalidated: boolean; error?: string };
-          TS
-
-          # app/api/tasks
-          write app/api/tasks/route.ts <<'TS'
-          import { NextResponse } from "next/server";
-          import { TASKS_URL } from "@/lib/env";
-          export const runtime = "nodejs";
-          export async function GET() {
-            const r = await fetch(TASKS_URL, { cache: "no-store" });
-            const data = await r.json();
-            const res = NextResponse.json(data);
-            res.headers.set("Access-Control-Allow-Origin", "*");
-            return res;
-          }
-          TS
-
-          # app/api/nexus
-          write app/api/nexus/route.ts <<'TS'
-          import { NextResponse } from "next/server";
-          import { FEED_URL } from "@/lib/env";
-          export const runtime = "nodejs";
-          export async function GET() {
-            const r = await fetch(FEED_URL, { cache: "no-store" });
-            const data = await r.json();
-            const res = NextResponse.json(data);
-            res.headers.set("Access-Control-Allow-Origin", "*");
-            return res;
-          }
-          TS
-
-          # app/api/revalidate
-          write app/api/revalidate/route.ts <<'TS'
-          import { NextRequest, NextResponse } from "next/server";
-          import { revalidatePath } from "next/cache";
-          import { REVALIDATE_TOKEN } from "@/lib/env";
-          import type { RevalidateRequest, RevalidateResponse } from "@/lib/types";
-
-          export const runtime = "nodejs";
-
-          const CORS = {
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "POST, OPTIONS",
-            "Access-Control-Allow-Headers": "Content-Type, Authorization"
-          };
-
-          const json = (d: any, s = 200) => {
-            const r = NextResponse.json(d, { status: s });
-            Object.entries(CORS).forEach(([k, v]) => r.headers.set(k, v));
-            return r;
-          };
-
-          export async function OPTIONS() { return new NextResponse(null, { status: 200, headers: CORS }); }
-
-          export async function POST(req: NextRequest) {
-            if (!REVALIDATE_TOKEN) return json({ revalidated: false, error: "REVALIDATE_TOKEN not set" } as RevalidateResponse, 501);
-
-            const auth = req.headers.get("authorization") ?? "";
-            const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
-            if (token !== REVALIDATE_TOKEN) return json({ revalidated: false, error: "unauthorized" } as RevalidateResponse, 401);
-
-            const body = (await req.json().catch(() => ({}))) as RevalidateRequest;
-            let path = (body.path || "").trim();
-            if (!path) return json({ revalidated: false, error: "missing path" } as RevalidateResponse, 400);
-            if (!path.startsWith("/")) path = `/${path}`;
-
-            if (path === "/*") {
-              const targets = ["/", "/tasks", "/agents", "/contexts", "/status"];
-              targets.forEach(p => revalidatePath(p));
-              return json({ revalidated: true, paths: targets });
-            }
-            revalidatePath(path);
-            return json({ revalidated: true, path });
-          }
-          TS
-
-          # ensure robots/sitemap exist
-          mkdir -p public
-          [ -f public/robots.txt ] || cat > public/robots.txt <<'TXT'
-          User-agent: *
-          Allow: /
-          Sitemap: https://dev.jai.nexus/sitemap.xml
-          TXT
-          [ -f public/sitemap.xml ] || cat > public/sitemap.xml <<'XML'
-          <?xml version="1.0" encoding="UTF-8"?>
-          <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
-            <url><loc>https://dev.jai.nexus/</loc></url>
-            <url><loc>https://dev.jai.nexus/tasks</loc></url>
-            <url><loc>https://dev.jai.nexus/agents</loc></url>
-            <url><loc>https://dev.jai.nexus/contexts</loc></url>
-            <url><loc>https://dev.jai.nexus/status</loc></url>
-          </urlset>
-          XML
-
-          # Pin Next/React (avoid react@19/v0 conflicts)
-          jq '.dependencies.next="14.2.5" | .dependencies.react="18.2.0" | .dependencies["react-dom"]="18.2.0"' package.json > package.json.tmp \
-            && mv package.json.tmp package.json || true
-
-          # Make obvious .env example if missing
-          [ -f .env.example ] || cat > .env.example <<'ENV'
-          NEXT_PUBLIC_NEXUS_FEED=https://jai-nexus.github.io/public-nexus/data/nexus.json
-          NEXT_PUBLIC_TASKS_FEED=https://jai-nexus.github.io/public-nexus/data/tasks.json
-          REVALIDATE_TOKEN=replace-with-strong-secret
-          ENV
-
-          # Minimal null-safety codemods (don’t overfit; hit common cases)
-          for f in app/page.tsx app/agents/page.tsx app/contexts/page.tsx; do
-            [ -f "$f" ] || continue
-            sed -i 's/nexusData\.assets\.length/arr(nexusData?.assets).length/g' "$f" || true
-            sed -i 's/nexusData\.agents\.length/arr(nexusData?.agents).length/g' "$f" || true
-            sed -i 's/nexusData\.contexts\.length/arr(nexusData?.contexts).length/g' "$f" || true
-            sed -i 's/agent\.tags\.length/arr(agent.tags).length/g' "$f" || true
-            sed -i 's/context\.tags\.length/arr(context.tags).length/g' "$f" || true
-            # Ensure import { arr } is present when we touched file
-            if grep -q 'arr(' "$f" && ! grep -q 'from "@/lib/safe"' "$f"; then
-              awk 'NR==1{print "import { arr } from \"@/lib/safe\";"}1' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
-            fi
-          done
-
-          git add -A
-          if git diff --cached --quiet; then
-            echo "No wiki changes to commit."
-          else
-            git commit -m "operator: null-safe feeds + API routes + pin react/next + robots/sitemap"
-          fi
-
-      - name: Open or update PR to wiki-nexus
-        env:
-          GH_TOKEN: ${{ steps.app.outputs.token }}
-        working-directory: wiki
-        run: |
-          set -euo pipefail
-          git push -u origin "${BRANCH}" || git push -u origin "${BRANCH}" --force
-          if gh pr view --repo "${ORG}/${WIKI_REPO}" --head "${BRANCH}" >/dev/null 2>&1; then
-            echo "PR already open; updating body/title…"
-            PR=$(gh pr view --repo "${ORG}/${WIKI_REPO}" --head "${BRANCH}" --json number --jq .number)
-            gh pr edit "$PR" --repo "${ORG}/${WIKI_REPO}" --title "$PR_TITLE" --body "$PR_BODY" || true
-          else
-            gh pr create --repo "${ORG}/${WIKI_REPO}" --head "${BRANCH}" --base main --title "$PR_TITLE" --body "$PR_BODY"
-          fi
-
-      - name: Attempt auto-merge (if allowed)
-        if: ${{ inputs.auto_merge }}
-        env:
-          GH_TOKEN: ${{ steps.app.outputs.token }}
-        run: |
-          set -euo pipefail
-          PR=$(gh pr list --repo "${ORG}/${WIKI_REPO}" --head "${BRANCH}" --state open --json number --jq '.[0].number' || true)
-          if [ -n "$PR" ]; then
-            gh pr merge "$PR" --repo "${ORG}/${WIKI_REPO}" --squash --auto || gh pr merge "$PR" --repo "${ORG}/${WIKI_REPO}" --squash || true
-          fi
-
-      - name: Configure Vercel (env + domain) — optional
-        if: ${{ secrets.VERCEL_TOKEN != '' && secrets.VERCEL_PROJECT_ID != '' && secrets.VERCEL_ORG_ID != '' }}
+      - name: Configure Vercel (env + domain)
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
           VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
           VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          DOMAIN: ${{ inputs.domain }}
+          NEXT_PUBLIC_NEXUS_FEED: https://jai-nexus.github.io/public-nexus/data/nexus.json
+          NEXT_PUBLIC_TASKS_FEED: https://jai-nexus.github.io/public-nexus/data/tasks.json
           REVALIDATE_TOKEN: ${{ secrets.REVALIDATE_TOKEN }}
         run: |
           set -euo pipefail
+          miss=()
+          for k in VERCEL_TOKEN VERCEL_PROJECT_ID VERCEL_ORG_ID; do
+            [ -z "${!k:-}" ] && miss+=("$k")
+          done
+          if [ "${#miss[@]}" -gt 0 ]; then
+            echo "Vercel config skipped; missing: ${miss[*]}"; exit 0; fi
 
-          api() { curl -fsSL -H "Authorization: Bearer ${VERCEL_TOKEN}" -H "Content-Type: application/json" "$@"; }
-
-          # Upsert envs (prod+preview+dev)
-          for key in NEXT_PUBLIC_NEXUS_FEED NEXT_PUBLIC_TASKS_FEED REVALIDATE_TOKEN; do
-            val=""
-            case "$key" in
-              NEXT_PUBLIC_NEXUS_FEED) val="https://jai-nexus.github.io/public-nexus/data/nexus.json";;
-              NEXT_PUBLIC_TASKS_FEED) val="https://jai-nexus.github.io/public-nexus/data/tasks.json";;
-              REVALIDATE_TOKEN)       val="${REVALIDATE_TOKEN}";;
-            esac
-            [ -n "$val" ] || continue
-            api -X POST "https://api.vercel.com/v10/projects/${VERCEL_PROJECT_ID}/env" \
-              --data "{\"type\":\"encrypted\",\"key\":\"${key}\",\"value\":\"${val}\",\"target\":[\"production\",\"preview\",\"development\"]}" \
+          for kv in \
+            "NEXT_PUBLIC_NEXUS_FEED=$NEXT_PUBLIC_NEXUS_FEED" \
+            "NEXT_PUBLIC_TASKS_FEED=$NEXT_PUBLIC_TASKS_FEED" \
+            "REVALIDATE_TOKEN=$REVALIDATE_TOKEN"; do
+            key="${kv%%=*}"; val="${kv#*=}"
+            [ -z "$val" ] && continue
+            curl -fsS -X POST "https://api.vercel.com/v10/projects/$VERCEL_PROJECT_ID/env" \
+              -H "Authorization: Bearer $VERCEL_TOKEN" \
+              -H "Content-Type: application/json" \
+              --data "{\"type\":\"encrypted\",\"key\":\"$key\",\"value\":\"$val\",\"target\":[\"production\",\"preview\"]}" \
               || true
           done
 
-          # Attach domain (requires DNS CNAME dev → cname.vercel-dns.com)
-          api -X POST "https://api.vercel.com/v10/projects/${VERCEL_PROJECT_ID}/domains" \
-            --data "{\"name\":\"${DOMAIN}\"}" || true
+          if [ -n "${DOMAIN:-}" ]; then
+            curl -fsS -X POST "https://api.vercel.com/v10/projects/$VERCEL_PROJECT_ID/domains" \
+              -H "Authorization: Bearer $VERCEL_TOKEN" \
+              -H "Content-Type: application/json" \
+              --data "{\"name\":\"$DOMAIN\"}" || true
+          fi
 
-      - name: Revalidate dev.jai.nexus — optional
+      - name: Revalidate dev.jai.nexus
         if: ${{ secrets.REVALIDATE_TOKEN != '' }}
         env:
           TOKEN: ${{ secrets.REVALIDATE_TOKEN }}
         run: |
           set -euo pipefail
-          curl -sS -X POST "https://dev.jai.nexus/api/revalidate" \
-            -H "Authorization: Bearer ${TOKEN}" \
+          curl -fsS -X POST "https://dev.jai.nexus/api/revalidate" \
+            -H "Authorization: Bearer $TOKEN" \
             -H "Content-Type: application/json" \
             -d '{"path":"/*"}' || true
