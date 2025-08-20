@@ -13,6 +13,11 @@ on:
   schedule:
     - cron: "15 * * * *" # hourly at :15
 
+# prevent overlapping runs that cause PR/branch spam
+concurrency:
+  group: public-nexus-org-tasks
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -28,7 +33,7 @@ jobs:
           private-key: ${{ secrets.ORG_APP_PRIVATE_KEY }}
           owner: jai-nexus
           repositories: public-nexus
-          # App installation must grant: Contents:write, Pull requests:write
+          # NOTE: App installation must grant at least: Contents:write, Pull requests:write
 
       - name: Checkout .github (this repo)
         uses: actions/checkout@v4
@@ -63,7 +68,8 @@ jobs:
           name: org-tasks
           path: out/tasks.json
 
-      - name: Publish to public-nexus (branch + PR)
+      # --------- PUBLISH: single branch + single PR (no homepage overwrite) ---------
+      - name: Publish to public-nexus (single branch + PR)
         if: ${{ github.event_name == 'schedule' || github.event.inputs.publish != 'false' }}
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
@@ -73,29 +79,4 @@ jobs:
           GIT_COMMITTER_EMAIL: "bots@jai.nexus"
         run: |
           set -euo pipefail
-          export GITHUB_TOKEN="$GH_TOKEN"   # ensure gh uses the App token
-
-          git clone --depth=1 "https://x-access-token:${GH_TOKEN}@github.com/jai-nexus/public-nexus.git" site
-          mkdir -p site/data
-          cp -f out/tasks.json site/data/tasks.json
-          if [ -f codex/tasks_index.html ]; then
-            cp -f codex/tasks_index.html site/index.html
-          fi
-
-          cd site
-          git add -A
-          if git diff --cached --quiet; then
-            echo "No changes to publish."; exit 0
-          fi
-
-          branch="org-tasks-$(date +%Y%m%d-%H%M%S)"
-          git checkout -b "$branch"
-          git commit -m "site(tasks): automated update of org tasks JSON + UI"
-          git push origin "$branch"
-
-          gh pr create \
-            --repo jai-nexus/public-nexus \
-            --head "$branch" \
-            --base main \
-            --title "site(tasks): update org tasks" \
-            --body "Automated update from .github/org_tasks workflow."
+          export GITHUB_TOKEN="$GH_TOKEN"   # ensure gh uses the
