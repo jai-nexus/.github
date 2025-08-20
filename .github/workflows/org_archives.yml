@@ -1,0 +1,244 @@
+name: Org Archives
+
+on:
+  workflow_dispatch:
+    inputs:
+      since_days:
+        description: "Look back N days"
+        default: "3"
+  schedule:
+    - cron: "20 * * * *" # hourly :20
+
+permissions:
+  contents: read
+
+jobs:
+  archive:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: App token (org)
+        id: app
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.ORG_APP_ID }}
+          private-key: ${{ secrets.ORG_APP_PRIVATE_KEY }}
+          owner: jai-nexus
+          repositories: docs-nexus # needs Contents:write via PR
+
+      - name: Checkout .github
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Build archives
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          ORG: jai-nexus
+          SINCE_DAYS: ${{ github.event.inputs.since_days || '3' }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          node -e 'console.log("Node",process.version)'
+
+          # --- crawler script (inline) ---
+          cat > crawler.mjs <<'JS'
+          import fs from "node:fs/promises";
+
+          const GH = process.env.GH_TOKEN;
+          const ORG = process.env.ORG ?? "jai-nexus";
+          const SINCE_DAYS = parseInt(process.env.SINCE_DAYS ?? "3",10);
+          if (!GH) { console.error("Missing GH_TOKEN"); process.exit(1); }
+          const sinceISO = new Date(Date.now() - SINCE_DAYS*864e5).toISOString();
+
+          const H = {
+            "Authorization": `token ${GH}`,
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "jai-org-archiver"
+          };
+
+          async function paged(path){
+            const url = `https://api.github.com${path}${path.includes("?")?"&":"?"}per_page=100`;
+            const res = await fetch(url,{headers:H});
+            if(!res.ok) throw new Error(`GitHub ${res.status} for ${path}`);
+            const data = await res.json();
+            const link = res.headers.get("link");
+            if(link && link.includes('rel="next"')){
+              const next = link.split(",").find(s=>s.includes('rel="next"')).split(";")[0].trim().slice(1,-1);
+              const more = await paged(new URL(next).pathname + new URL(next).search);
+              return data.concat(more);
+            }
+            return data;
+          }
+
+          function cut(s, n=280){ return (s||"").replace(/\s+/g," ").slice(0,n); }
+
+          function toJAI(rec){
+            // minimal JAI front-matter in markdown (for long-term tools)
+            const fm = {
+              id: rec.id, type: rec.type, org: rec.org, repo: rec.repo,
+              number: rec.number, sha: rec.sha, tag: rec.tag,
+              title: rec.title, url: rec.url, author: rec.author,
+              createdAt: rec.createdAt, updatedAt: rec.updatedAt,
+              closedAt: rec.closedAt, mergedAt: rec.mergedAt,
+              labels: rec.labels || []
+            };
+            const head = `---jai\n${Object.entries(fm).filter(([,v])=>v!==undefined).map(([k,v])=>`${k}: ${Array.isArray(v)?JSON.stringify(v):v}`).join("\n")}\n---\n`;
+            const body = (rec.body||"").trim();
+            return head + (body ? (body+"\n") : "");
+          }
+
+          // Collect repos (public)
+          const repos = await paged(`/orgs/${ORG}/repos?type=public&sort=updated`);
+          const since = sinceISO;
+          const items = [];
+
+          for (const r of repos) {
+            const repo = r.name;
+            // issues (includes PRs)
+            const issues = await paged(`/repos/${ORG}/${repo}/issues?state=all&since=${encodeURIComponent(since)}`);
+            for (const it of issues) {
+              const isPR = !!it.pull_request;
+              items.push({
+                org: ORG, repo,
+                type: isPR ? "pr" : "issue",
+                id: `${ORG}/${repo}#${it.number}`,
+                number: it.number,
+                title: it.title,
+                url: it.html_url,
+                author: it.user?.login,
+                labels: (it.labels||[]).map(l=>l.name).filter(Boolean),
+                body: it.body || "",
+                createdAt: it.created_at,
+                updatedAt: it.updated_at,
+                closedAt: it.closed_at,
+              });
+            }
+            // releases
+            const rels = await paged(`/repos/${ORG}/${repo}/releases`);
+            rels.filter(x=>x.created_at>=since).forEach(x=>{
+              items.push({
+                org: ORG, repo, type: "release",
+                id: `${ORG}/${repo}@${x.tag_name}`,
+                tag: x.tag_name,
+                title: x.name || `Release ${x.tag_name}`,
+                url: x.html_url,
+                author: x.author?.login,
+                body: x.body || "",
+                createdAt: x.created_at,
+                updatedAt: x.published_at
+              });
+            });
+            // commits (default branch)
+            try {
+              const branch = r.default_branch || "main";
+              const cs = await paged(`/repos/${ORG}/${repo}/commits?sha=${branch}&since=${encodeURIComponent(since)}`);
+              cs.forEach(c=>{
+                items.push({
+                  org: ORG, repo, type: "commit",
+                  id: `${ORG}/${repo}@${c.sha.slice(0,7)}`,
+                  sha: c.sha,
+                  title: cut(c.commit?.message?.split("\n")[0]||""),
+                  url: c.html_url,
+                  author: c.commit?.author?.name || c.author?.login,
+                  body: c.commit?.message || "",
+                  createdAt: c.commit?.author?.date,
+                  updatedAt: c.commit?.committer?.date
+                });
+              });
+            } catch { /* ignore */ }
+          }
+
+          // Sort chronologically
+          items.sort((a,b)=>String(a.createdAt).localeCompare(String(b.createdAt)));
+
+          // Write NDJSON
+          const nd = items.map(x=>JSON.stringify(x)).join("\n")+"\n";
+          await fs.writeFile("out/archives.ndjson", nd);
+
+          // Per-day buckets
+          const buckets = new Map();
+          for(const x of items){
+            const d = (x.createdAt||"").slice(0,10);
+            if(!d) continue;
+            if(!buckets.has(d)) buckets.set(d, []);
+            buckets.get(d).push(x);
+          }
+          // write YYYY/MM/DD.json
+          for(const [d, arr] of buckets){
+            const [Y,M,D] = d.split("-");
+            await fs.mkdir(`out/daily/${Y}/${M}`, {recursive:true});
+            await fs.writeFile(`out/daily/${Y}/${M}/${D}.json`, JSON.stringify(arr,null,2));
+          }
+
+          // feed.json
+          const latest = items.slice(-50);
+          const totals = {
+            items: items.length,
+            repos: Array.from(new Set(items.map(x=>x.repo))).sort()
+          };
+          await fs.writeFile("out/feed.json", JSON.stringify({
+            generatedAt: new Date().toISOString(), totals, latest
+          }, null, 2));
+
+          // Optional JAI files
+          await fs.mkdir("out/jai", {recursive:true});
+          let i=0;
+          for(const x of items.slice(-200)){ // keep this light
+            const id = x.id.replace(/[^\w\-@.]/g,"_");
+            await fs.writeFile(`out/jai/${id}.md`, toJAI(x));
+            if(++i%50===0) await new Promise(r=>setTimeout(r,50));
+          }
+
+          console.log(`Done: ${items.length} items across ${totals.repos.length} repos since ${since}.`);
+          JS
+
+          node crawler.mjs
+          echo "Preview top feed:"
+          head -n 40 out/archives.ndjson || true
+
+      - name: Publish to docs-nexus (single PR)
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          GIT_AUTHOR_NAME: "jai-org-hardener[bot]"
+          GIT_AUTHOR_EMAIL: "bots@jai.nexus"
+          GIT_COMMITTER_NAME: "jai-org-hardener[bot]"
+          GIT_COMMITTER_EMAIL: "bots@jai.nexus"
+        run: |
+          set -euo pipefail
+          export GITHUB_TOKEN="$GH_TOKEN"
+          repo="jai-nexus/docs-nexus"
+          branch="org-archives"
+
+          git clone --depth=1 "https://x-access-token:${GH_TOKEN}@github.com/${repo}.git" site
+          mkdir -p site/data site/assets site/jai site/daily
+          cp -f out/archives.ndjson site/data/archives.ndjson
+          cp -f out/feed.json       site/data/feed.json
+          rsync -a out/daily/       site/daily/ || true
+          rsync -a out/jai/         site/jai/ || true
+          touch site/.nojekyll
+
+          cd site
+          git checkout -B "$branch"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes."
+            exit 0
+          fi
+          git commit -m "archive: automated update (org-wide)"
+          git push -u origin "$branch"
+
+          # Create PR if absent
+          if ! gh pr list --repo "$repo" --head "$branch" --state open --json number --jq 'length>0' | grep -q true; then
+            gh pr create \
+              --repo "$repo" \
+              --head "$branch" \
+              --base main \
+              --title "archive: org-wide update" \
+              --body "Automated update from .github/org_archives workflow."
+          else
+            echo "PR already open; updated branch."
+          fi
