@@ -26,7 +26,7 @@ jobs:
           owner: jai-nexus
           permission-contents: read
           # enable only if you plan to write an issue comment (step below)
-          permission-issues: write
+
           # (no 'permissions:' JSON; the action wants per-permission inputs)  # <-- important
 
       - name: Build CSV
