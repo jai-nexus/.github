@@ -21,9 +21,6 @@ jobs:
     runs-on: ubuntu-latest
     # Put secrets into env so we can test them without leaking values
     env:
-      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
-      VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
-      VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
       REVALIDATE_TOKEN: ${{ secrets.REVALIDATE_TOKEN }}
       DOMAIN: ${{ inputs.domain }}
       NEXT_PUBLIC_NEXUS_FEED: https://jai-nexus.github.io/public-nexus/data/nexus.json
